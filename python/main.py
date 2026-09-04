@@ -173,6 +173,9 @@ def main(raw_config: Config):
         wandb_entity=config.wandb_entity,
         wandb_group=config.wandb_group,
         wandb_run_name=run_name,
+        # Each checkpoint's eval restores that checkpoint's own step counter, so the axis
+        # is non-monotonic by design here -- see BaseDataLogger.
+        allow_non_monotonic_steps=config.evaluation_mode,
     )
 
     random.seed(mk_seed(np_rng))

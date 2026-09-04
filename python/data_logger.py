@@ -159,9 +159,23 @@ Loggable = SupportsFloat | Media | np.ndarray
 
 
 class BaseDataLogger(ABC):
-    def __init__(self, default_initial_step_value: int = 0):
+    def __init__(
+        self,
+        default_initial_step_value: int = 0,
+        allow_non_monotonic_steps: bool = False,
+    ):
         self.__current_step = None
         self.__default_initial_step_value = default_initial_step_value
+        # Evaluation mode rolls out several checkpoints in one process, and each
+        # _load_checkpoint restores that checkpoint's own total_env_steps -- so the step
+        # axis necessarily walks backwards every time the next, *earlier*-trained
+        # checkpoint is loaded, and the monotonicity check below aborts the run. It only
+        # showed up once evaluation ran long enough per checkpoint to overshoot the next
+        # one's starting step, which is why a short eval pass appears to work.
+        # Relaxed only where the axis is meaningless by construction (evaluation_mode,
+        # set from main.py); during training the step is a real timeline and a backwards
+        # jump is a bug worth failing on, so the check stays.
+        self.__allow_non_monotonic_steps = allow_non_monotonic_steps
 
     def write(self, data: dict[str, Loggable], step: int | None = None):
         if step is None:
@@ -170,7 +184,11 @@ class BaseDataLogger(ABC):
                 if self.__current_step is not None
                 else self.__default_initial_step_value
             )
-        if self.__current_step is not None and step < self.__current_step:
+        if (
+            not self.__allow_non_monotonic_steps
+            and self.__current_step is not None
+            and step < self.__current_step
+        ):
             raise ValueError("Log step must be monotonically increasing")
         self._write(data, step)
         self.__current_step = step
@@ -178,6 +196,10 @@ class BaseDataLogger(ABC):
     @abstractmethod
     def _write(self, data: dict[str, Loggable], step: int):
         pass
+
+    @property
+    def allow_non_monotonic_steps(self) -> bool:
+        return self.__allow_non_monotonic_steps
 
     @property
     def current_step(self) -> int | None:
@@ -199,8 +221,9 @@ class DataLogger(BaseDataLogger):
         wandb_entity: str | None = None,
         wandb_group: str | None = None,
         wandb_run_name: str | None = None,
+        allow_non_monotonic_steps: bool = False,
     ):
-        super().__init__()
+        super().__init__(allow_non_monotonic_steps=allow_non_monotonic_steps)
         self.__run_directory = run_directory
         self.__hyperparameters = hyperparameters
         self.__use_tensorboard = use_tensorboard
@@ -333,7 +356,10 @@ class CustomAxisDataLogger(BaseDataLogger):
         axis_name: str,
         display_axis_name: str | None = None,
     ):
-        super().__init__()
+        # Inherited from the parent: the per-env axis loggers are the ones the algorithm
+        # actually writes through, so relaxing the check only on the parent leaves
+        # evaluation mode raising from here instead.
+        super().__init__(allow_non_monotonic_steps=logger.allow_non_monotonic_steps)
         self.__logger = logger
         self.__axis_name = axis_name
         self.__registered_metrics = set()
