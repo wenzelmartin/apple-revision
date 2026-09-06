@@ -90,3 +90,18 @@ metric_log_level: BASIC
 
 # Whether to interpret the final (timeout) truncation in an episode as a termination signal for the agent.
 interpret_final_truncation_as_termination: false
+
+# "module:function" building demonstrations to seed the replay buffer with before training
+# (see apple_bridge/demo_prefill.py), or null for the usual empty buffer.
+demo_source: null
+
+# Roughly how many demonstration episodes to seed with; 0 disables seeding.
+demo_episodes: 0
+
+# Seed for the demonstrator and its env resets.
+demo_seed: 0
+
+# Fraction of each training batch drawn specifically from the demonstrations rather than
+# uniformly from the whole buffer. 0 = plain SACfD (demo share of a batch decays as
+# training data accumulates), >0 pins it for the whole run.
+demo_sample_fraction: 0.0

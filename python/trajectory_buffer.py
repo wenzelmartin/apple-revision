@@ -353,6 +353,7 @@ class TrajectoryBuffer(Sequence[TrajectoryType]):
         context_length: int = 0,
         active_stream_mask: jax.Array | None = None,
         oversampling_factor: int = 16,
+        max_trajectories_per_stream: jax.Array | None = None,
     ) -> TrajectoryBatch[TrajectoryType]:
         # The following must hold for valid starting points:
         # 1. There must be enough space until the end of the buffer (ensured when computing the trajectory counts).
@@ -364,6 +365,17 @@ class TrajectoryBuffer(Sequence[TrajectoryType]):
         rng_trajectory, rng_subsample, rng_offset = jax.random.split(rng, 3)
         self_populated = self.populate_cache(sequence_length)
         trajectory_counts = self_populated._cache.trajectory_counts[sequence_length]
+        if max_trajectories_per_stream is not None:
+            # Restrict the draw to the first N trajectories of each stream. Trajectory
+            # ordinal 0 is the oldest one still resident, so this addresses a prefix of the
+            # buffer's history -- used to sample demonstrations specifically, which are
+            # written before training starts and (given a buffer sized not to evict them)
+            # stay at ordinals [0, N). Callers that pass a prefix which has since been
+            # evicted would silently sample training data instead, so the guarantee lives
+            # with the buffer sizing, not here.
+            trajectory_counts = jnp.minimum(
+                trajectory_counts, max_trajectories_per_stream
+            )
         if active_stream_mask is None:
             active_stream_mask = jnp.ones(trajectory_counts.shape[0], dtype=jnp.bool_)
         start_indices = jax.random.randint(

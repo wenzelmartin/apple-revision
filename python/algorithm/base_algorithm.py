@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import importlib
 import logging
 import math
 import re
@@ -281,6 +282,27 @@ class BaseAlgorithmConfig(ABC, Generic[AlgorithmType]):
     # Whether to interpret the final (timeout) truncation in an episode as a termination signal for the agent.
     interpret_final_truncation_as_termination: bool
 
+    # "module:function" producing demonstrations to seed the replay buffer with before
+    # training, or None for the usual empty buffer. The callable is passed the raw vector
+    # env and a freshly built buffer, and returns (filled buffer, stats dict) -- see
+    # apple_bridge/demo_prefill.py:build_demo_buffer. Demonstrations give an off-policy
+    # learner examples of actions the policy would otherwise never explore; this exists
+    # because the surface-grid declare action is never taken without them.
+    demo_source: str | None
+
+    # Roughly how many demonstration episodes to seed the buffer with. 0 disables seeding
+    # even when demo_source is set.
+    demo_episodes: int
+
+    # Seed for the demonstrator's own RNG and for the demo env resets.
+    demo_seed: int
+
+    # Fraction of every training batch drawn from the demonstrations specifically, rather
+    # than uniformly from the whole buffer. 0 keeps the plain SACfD behaviour (demos are
+    # just ordinary buffer content and their share of a batch decays as training data
+    # accumulates); >0 pins their share for the whole run. Ignored without demo_source.
+    demo_sample_fraction: float
+
     @abstractmethod
     def make_algorithm(self) -> AlgorithmType:
         pass
@@ -316,6 +338,13 @@ class BaseAlgorithm(
     __data_logger: DataLogger = ContextVar()
     __train_logger: BaseDataLogger = ContextVar()
     __eval_logger: BaseDataLogger = ContextVar()
+    __demo_buffer: "TrajectoryBuffer | None" = ContextVar()
+    # Per-stream count of trajectories that came from the demonstrations, or None when the
+    # run has no demos. The demo trajectories are the *oldest* in each stream's ring, so
+    # ordinals [0, demo_trajectory_counts) address exactly them -- which is what lets
+    # sample_batch draw a demo-only sub-batch without a second buffer. This stays valid
+    # only because the buffer is sized to never evict them (see __build_demo_buffer).
+    demo_trajectory_counts: "jax.Array | None" = ContextVar()
 
     __context: Literal["initializing", "initialized"] = None
     __context_variables: tuple[str, ...] = None
@@ -1023,6 +1052,17 @@ class BaseAlgorithm(
 
             c_self.agent = c_self._mk_agent(c_self.train_env)
             c_self.algorithm_settings = c_self._get_algorithm_settings()
+            # Built here, outside the jit'd _train, because _mk_initial_state runs inside
+            # that trace: a Python loop of add_step calls there would unroll one copy per
+            # demo step into the graph. `env` is the raw vector env, so rolling the
+            # demonstrator on it does not advance LogWrapper's step counter -- which gates
+            # learning_starts and the training budget.
+            c_self.__demo_buffer = c_self.__build_demo_buffer(env)
+            c_self.demo_trajectory_counts = (
+                None
+                if c_self.__demo_buffer is None
+                else c_self.__demo_buffer.trajectory_info.length
+            )
 
             checkpoint_dir = (
                 c_self.__data_logger.run_directory / "checkpoints"
@@ -1039,19 +1079,51 @@ class BaseAlgorithm(
                 c_self.__context = "initialized"
                 yield c_self
 
+    def __build_demo_buffer(self, raw_env) -> TrajectoryBuffer | None:
+        """Replay buffer pre-filled by ``config.demo_source``, or None if not configured."""
+        if not self.config.demo_source or self.config.demo_episodes <= 0:
+            return None
+        module_name, _, attribute = self.config.demo_source.partition(":")
+        if not attribute:
+            raise ValueError(
+                f"demo_source must be 'module:function', got {self.config.demo_source!r}"
+            )
+        build = getattr(importlib.import_module(module_name), attribute)
+
+        def make_buffer(extra_capacity: int) -> TrajectoryBuffer:
+            # Room for the demonstrations *on top of* the training budget. The algorithm's
+            # own trajectory_buffer_size is exactly the number of steps training writes per
+            # stream, so a buffer of that size evicts whatever was prefilled before the run
+            # ends -- see build_demo_buffer's docstring for the measurement.
+            return TrajectoryBuffer.build(
+                self._get_trajectory_variable_spec(),
+                capacity=self.algorithm_settings.trajectory_buffer_size + extra_capacity,
+                stream_count=self.train_env.num_envs,
+            )
+
+        buffer, _ = build(
+            raw_env,
+            make_buffer,
+            episodes=self.config.demo_episodes,
+            seed=self.config.demo_seed,
+        )
+        return buffer
+
     def _mk_initial_state(
         self, rng: jax.Array, create_trajectory_buffer: bool = True
     ) -> _MainState:
         new_rng, rng_agent_init, train_rng, reset_rng_train = jax.random.split(rng, 4)
 
-        if create_trajectory_buffer:
+        if not create_trajectory_buffer:
+            trajectory_buffer = None
+        elif self.__demo_buffer is not None:
+            trajectory_buffer = self.__demo_buffer
+        else:
             trajectory_buffer = TrajectoryBuffer.build(
                 self._get_trajectory_variable_spec(),
                 capacity=self.algorithm_settings.trajectory_buffer_size,
                 stream_count=self.train_env.num_envs,
             )
-        else:
-            trajectory_buffer = None
 
         assert isinstance(self.train_env.action_space, gym.spaces.Dict)
         act_sample = fix_ordered_dicts(self.train_env.inner_action_space.sample())

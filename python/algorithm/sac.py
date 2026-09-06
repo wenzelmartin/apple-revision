@@ -837,6 +837,55 @@ class SAC(
             sample_sequence_length,
         )
 
+        # How much of each batch is reserved for demonstrations. Without this, demos are
+        # only ever a fixed *slice of the buffer*, so their share of a batch is whatever
+        # uniform sampling gives them -- which is how a prefilled run can start out
+        # declaring in every episode and stop within a few thousand steps: once on-policy
+        # non-declaring data outnumbers them, nothing in the batch shows the critic what a
+        # declare is worth. Reserving a fixed fraction keeps that signal in every update.
+        demo_trajectory_counts = self.demo_trajectory_counts
+        demo_batch_size = 0
+        if demo_trajectory_counts is not None and self.config.demo_sample_fraction > 0:
+            demo_batch_size = int(
+                round(self.config.batch_size * self.config.demo_sample_fraction)
+            )
+            # Both halves must stay non-empty: a zero-size sample_batch is degenerate, and
+            # a batch that is *all* demos would make this offline behaviour cloning.
+            demo_batch_size = min(max(demo_batch_size, 1), self.config.batch_size - 1)
+            logger.info(
+                f"Reserving {demo_batch_size}/{self.config.batch_size} of each batch for "
+                f"demonstrations (demo_sample_fraction="
+                f"{self.config.demo_sample_fraction})."
+            )
+
+        def sample_training_batch(rng: jax.Array):
+            if demo_batch_size == 0:
+                return trajectory_buffer.sample_batch(
+                    rng,
+                    self.config.batch_size,
+                    sample_sequence_length,
+                    context_length=context_length,
+                )
+            rng_fresh, rng_demo = jax.random.split(rng)
+            fresh = trajectory_buffer.sample_batch(
+                rng_fresh,
+                self.config.batch_size - demo_batch_size,
+                sample_sequence_length,
+                context_length=context_length,
+            )
+            # Drawn from the whole buffer, so the demonstrations are eligible here too;
+            # the reserved half only puts a floor under their share, it does not cap it.
+            demo = trajectory_buffer.sample_batch(
+                rng_demo,
+                demo_batch_size,
+                sample_sequence_length,
+                context_length=context_length,
+                max_trajectories_per_stream=demo_trajectory_counts,
+            )
+            return jax.tree.map(
+                lambda a, b: jnp.concatenate([a, b], axis=0), fresh, demo
+            )
+
         def rem_ctx(tree: Any, axis: int = 1):
             return jax.tree.map(
                 lambda x: x[
@@ -1313,12 +1362,7 @@ class SAC(
             gradient_step = training_state.algorithm_state.gradient_step + sub_step
             sub_step_rng, batch_sample_rng = jax.random.split(sub_step_rng)
 
-            batch_traj_buffer = trajectory_buffer.sample_batch(
-                batch_sample_rng,
-                self.config.batch_size,
-                sample_sequence_length,
-                context_length=context_length,
-            )
+            batch_traj_buffer = sample_training_batch(batch_sample_rng)
 
             actor_update_rng, critic_update_rng = jax.random.split(sub_step_rng)
             if not self.config.disable_critic_update:
